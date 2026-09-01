@@ -1,235 +1,280 @@
-# Overdriver — Arma 3 External ESP
+<div align="center">
 
-Sistema externo de ESP (Extra Sensory Perception) para Arma 3 Build 2.22, desenvolvido como projeto de engenharia reversa de sistemas de baixo nível.
+# 🔫 OVERDRIVER
 
-> **Aviso**: Este projeto é puramente educacional e de pesquisa em engenharia reversa. Não se destina a uso em servidores multiplayer competitivos.
+### Arma 3 External ESP — Engenharia Reversa de Sistemas de Baixo Nível
 
----
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/License-Educational-yellow?style=for-the-badge)
 
-## O que é
-
-Um overlay transparente que se sobrepõe ao jogo Arma 3 e desenha boxes 3D (wireframe) ao redor dos jogadores detectados, mostrando posição, distância e profundidade em tempo real.
-
-```
-┌─────────────────────────────────────┐
-│          Arma 3 (jogo)              │
-│                                     │
-│    ┌───┐          ┌───┐             │
-│    │ □ │          │ □ │ ← boxes 3D │
-│    └─┬─┘          └─┬─┘   overlay  │
-│      │              │               │
-│   [player]      [player]           │
-└─────────────────────────────────────┘
-```
+*Sistema externo de ESP para Arma 3 Build 2.22 — detecção de players via heap scanning, projeção W2S matemática e overlay 3D com transparência per-pixel.*
 
 ---
 
-## Arquitetura do Sistema
+[![Sistema](https://img.shields.io/badge/Status-DESENVOLVIMENTO-orange?style=flat-square)]()
+[![Engine](https://img.shields.io/badge/Engine-W2S_Math-green?style=flat-square)]()
+[![Overlay](https://img.shields.io/badge/Overlay-DIB%2BULW-blue?style=flat-square)]()
 
-```
-┌──────────────┐    leitura     ┌──────────────┐    JSON     ┌──────────────┐
-│  KPRL Driver │ ──────────────→│  W2S Engine  │ ──────────→ │   Overlay    │
-│  (Ring 0)    │  memória do    │  (Ring 3)    │  esp_final  │  (Ring 3)    │
-│              │  processo      │              │  .json      │  GDI/DIB     │
-└──────────────┘               └──────────────┘             └──────────────┘
-       │                             │                           │
-       │                             │                           │
-  Leitura passiva             Scan de players              Desenho de
-  de memória do               via vtable +                boxes 3D via
-  processo do jogo            projeção W2S                UpdateLayeredWindow
-```
-
-### Componentes
-
-| Componente | Tipo | Descrição |
-|------------|------|-----------|
-| **kprl.sys** | Driver Ring 0 | Leitura passiva de memória do processo alvo via IOCTL |
-| **mem_core.py** | API Python | Interface com o driver KPRL para leitura de memória |
-| **w2s_fast.py** | Engine ESP | Scan de players + projeção World-to-Screen + yaw brute-force |
-| **overlay_3d.py** | Overlay Ring 3 | Janela transparente com DIB + UpdateLayeredWindow |
+</div>
 
 ---
 
-## Como Funciona
+## 📋 Visão Geral
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     PIPELINE DE DADOS                        │
+│                                                              │
+│  ┌─────────┐    IOCTL     ┌──────────┐   JSON    ┌────────┐ │
+│  │  KPRL   │ ──────────→ │  Engine  │ ───────→ │Overlay │ │
+│  │ Driver  │  leitura     │   ESP    │ esp_final│  3D    │ │
+│  │ Ring 0  │  passiva     │  Ring 3  │   .json  │ Ring 3 │ │
+│  └─────────┘              └──────────┘          └────────┘ │
+│                                                              │
+│  → Heap scan por vtable    → Projeção W2S     → DIB + ULW  │
+│  → ~116 players detectados → Yaw brute-force  → Wireframe  │
+│  → Filtro anti-false-pos   → ~5ms/frame       → 30 FPS     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🏗️ Arquitetura
+
+### Stack Tecnológica
+
+| Camada | Componente | Tecnologia |
+|--------|-----------|------------|
+| **Ring 0** | KPRL Driver | IOCTL, leitura passiva de memória |
+| **Ring 3** | W2S Engine | Python, numpy, vtable scan |
+| **Ring 3** | Overlay 3D | GDI, DIB Section, UpdateLayeredWindow |
+
+### Fluxo de Dados
+
+```
+1. Driver KPRL lê a heap do processo arma3_x64.exe (passivo, sem hook)
+                    ↓
+2. Engine escaneia por vtable pattern (MOD + 0x1C18CA8 em +0x0D0)
+                    ↓
+3. Para cada player encontrado: lê posição (X, Z, Y) = 12 bytes
+                    ↓
+4. Filtra outliers (cluster analysis) → remove falsos positivos
+                    ↓
+5. Projeta 3D→2D via W2S matemático (yaw, fov, perspective)
+                    ↓
+6. Salva esp_final.json → Overlay lê e desenha boxes 3D
+```
+
+---
+
+## 🎯 Como Funciona
 
 ### 1. Detecção de Players (Heap Scan)
 
-O engine escaneia a heap do processo `arma3_x64.exe` procurando um padrão específico:
+O engine busca o **vtable pattern** `MOD + 0x1C18CA8` em toda a heap do jogo:
 
 ```
 Player Struct Layout (Build 2.22):
-  +0x000: X (float, East)
-  +0x004: Z (float, Up/height)
-  +0x008: Y (float, North)
-  ...
-  +0x0D0: VTABLE pointer → MOD + 0x1C18CA8
+┌─────────────────────────────────────────┐
+│ +0x000 │ X  (float) │ East position    │
+│ +0x004 │ Z  (float) │ Height (Up)      │
+│ +0x008 │ Y  (float) │ North position   │
+│   ...  │            │                  │
+│ +0x0D0 │ VTABLE PTR │ → MOD+0x1C18CA8  │
+└─────────────────────────────────────────┘
 ```
 
-O scan busca o valor `MOD + 0x1C18CA8` na heap. Cada ocorrência indica um potencial player struct. O offset `+0x0D0` contém o ponteiro da vtable, confirmando que é um objeto válido do tipo player.
+**Filtros aplicados:**
+- Range de coordenadas: |X| < 100k, |Y| < 100k, 0 ≤ Z ≤ 2000
+- Cluster analysis: remove outliers > 3× distância mediana do centróide
+- Resultado: ~100-130 players reais por scan
 
-**Filtro anti-falso-positivo**: Remove players muito distantes do cluster principal (outliers > 3x distância mediana do centróide).
+### 2. World-to-Screen (Projeção Matemática)
 
-### 2. Identificação do Local vs Amigos
-
-```python
-# Local = player mais próximo do centróide de todos os players
-cx = mean(p['x'] for p in players)
-cy = mean(p['y'] for p in players)
-local = closest_to(players, cx, cy)
-```
-
-### 3. World-to-Screen (Projeção Matemática)
-
-Em vez de encontrar a ViewProjection Matrix na memória (que mudou nesta build), usamos projeção analítica:
+Em vez de encontrar a ViewProjection Matrix na memória (instável entre builds), usamos **projeção analítica**:
 
 ```python
-def project(eye, yaw, fov, world_pos, screen_size):
-    # 1. Calcula differencial mundo-eye
-    dx, dy, dz = world - eye
+# Arma 3 coordinate system: X=East, Z=Up, Y=North
+# Yaw: 0°=North, 90°=East, 180°=South
+
+def w2s(eye, yaw, fov, world_pos, screen):
+    dx = world.x - eye.x          # differential East
+    dy = world.z - eye.z          # differential Up
+    dz = world.y - eye.y          # differential North
     
-    # 2. Rotação por yaw (ângulo horizontal da câmera)
+    # Rotation by yaw
     rx = dx * cos(yaw) - dz * sin(yaw)
     rz = dx * sin(yaw) + dz * cos(yaw)
     
-    # 3. Projeção perspectiva
-    fz = 1 / tan(fov/2)
-    sx = (rx * fz / aspect) / rz * (sw/2) + sw/2
-    sy = sh/2 - (dy * fz / rz) * (sh/2)
+    # Perspective projection
+    focal = 1 / tan(fov / 2)
+    sx = (rx * focal / aspect) / rz * (sw/2) + (sw/2)
+    sy = sh/2 - (dy * focal / rz) * (sh/2)
     return sx, sy
 ```
 
-**Convenções do Arma 3**:
-- X = East (Leste)
-- Z = Up (Altura/vertical)
-- Y = North (Norte)
-- Yaw: 0° = Norte, 90° = Leste, 180° = Sul
+### 3. Yaw Detection (Orientação da Câmera)
 
-### 4. Yaw (Orientação da Câmera)
+O yaw é o ângulo horizontal da câmera. Métodos implementados:
 
-O yaw é o ângulo horizontal que a câmera do jogador está apontando. Encontrar este valor na memória é o maior desafio de RE.
+| Método | Precisão | Velocidade | Status |
+|--------|----------|------------|--------|
+| Camera Controller offset | Alta | Instantâneo | ⚠️ Instável entre builds |
+| Brute-force (0-359°) | Média | ~100ms/frame | ✅ Funcional |
+| Dynamic snapshot (diff) | Alta | ~3s | 🔬 Em teste |
 
-**Abordagens tentadas**:
-1. **Camera Controller** (+0x0C8 do player → offset interno): Funcionou na sessão anterior (forward em +0x1EC), mas os offsets mudaram na build multiplayer atual
-2. **Brute-force**: Testa todos os ângulos 0-359° e escolhe o que mais espalha os players na tela — funciona mas não é ideal
-3. **Scan dinâmico** (2 snapshots + diff): Detecta campos que mudam quando a câmera gira — método mais confiável para encontrar offsets
+### 4. Overlay 3D (Desenho)
 
-### 5. Overlay (Desenho)
-
-O overlay usa a API Windows GDI com DIB Section + UpdateLayeredWindow para transparência per-pixel:
+Janela transparente via `DIB Section + UpdateLayeredWindow`:
 
 ```
-┌─ CreateWindowEx (STATIC, WS_POPUP, WS_EX_LAYERED | WS_EX_TOPMOST)
-│
-├─ CreateDIBSection (buffer BGRA 32bpp)
-│  └─ buf[y * W + x] = cor do pixel
-│
-├─ Para cada player:
-│  ├─ Calcula 8 cantos do cubo 3D (mundo → tela via W2S)
-│  ├─ Desenha 12 arestas (Bresenham line) no buffer
-│  └─ Cor baseada na distância (verde/ciano/amarelo/vermelho)
-│
-└─ UpdateLayeredWindow (mostra buffer com transparência)
+CreateWindowEx → CreateDIBSection → Bresenham Lines → UpdateLayeredWindow
+     ↑                                                        ↓
+     └────────────── WS_EX_TOPMOST + LWA_COLORKEY ───────────┘
 ```
 
-**Escala de cores por distância**:
-- Verde: < 100m (perto)
-- Ciano: 100-500m
-- Amarelo: 500-2000m
-- Vermelho: > 2000m
+**Wireframe 3D:** 8 cantos do cubo projetados via W2S, 12 arestas desenhadas com Bresenham.
+
+**Cores por distância:**
+
+| Cor | Distância | Significado |
+|-----|-----------|-------------|
+| 🟢 Verde | < 100m | Inimigo próximo |
+| 🔵 Ciano | 100-500m | Distância média |
+| 🟡 Amarelo | 500-2000m | Distância longa |
+| 🔴 Vermelho | > 2000m | Muito longe |
 
 ---
 
-## Arquivos Principais
+## 📁 Estrutura do Projeto
 
 ```
 overdriver/
-├── mem_core.py          # API de leitura de memória via driver KPRL
-├── w2s_fast.py          # Engine principal (scan + projeção + yaw brute-force)
-├── w2s_engine.py        # Engine anterior (vtable scan por CHUNK)
-├── overlay_3d.py        # Overlay 3D com DIB + UpdateLayeredWindow
-├── overlay_gdi.py       # Overlay 2D anterior (GDI simples)
-├── w2s_math.py          # Núcleo matemático de projeção W2S
-├── esp_final.json       # Dados ESP em tempo real (gerado pelo engine)
-├── overlay_heartbeat.json  # Heartbeat do overlay
-├── kprl.sys             # Driver KPRL (leitura de memória)
-├── kill_orphans.ps1     # Script para matar processos órfãos
-├── docs/                # Documentação técnica
-│   └── plan_kernel.md   # Planos de desenvolvimento do driver
-└── github_repo/         # Este README
-    └── README.md
+├── w2s_fast.py          # 🚀 Engine principal (scan + projeção + yaw)
+├── w2s_engine.py        # 📦 Engine alternativa (vtable scan CHUNK)
+├── w2s_math.py          # 🧮 Núcleo matemático W2S
+├── overlay_3d.py        # 🖥️ Overlay 3D com DIB + UpdateLayeredWindow
+├── overlay_gdi.py       # 🖼️ Overlay 2D (versão simplificada)
+├── runner.py            # 🔄 Runner integrado (engine loop + overlay)
+├── mem_core.py          # 💾 API de leitura de memória via driver KPRL
+├── kprl.sys             # ⚙️ Driver Ring 0 (leitura passiva)
+├── esp_final.json       # 📊 Dados ESP em tempo real
+├── docs/                # 📚 Documentação técnica
+│   └── plan_kernel.md   #    Planos de desenvolvimento
+└── github_repo/         # 📖 Este README
 ```
 
 ---
 
-## Descobertas de Engenharia Reversa
-
-### Camera Controller (Build 2.22 antiga)
-```
-Player +0x0C8 → Camera Controller
-  +0x1C8: Eye Position (X, Z_height, Y)
-  +0x1EC: Forward Vector (unitário: east, up, north)
-  +0x2BC: FOV (half-angle = 0.5)
-  +0x224: Far clip plane (1.000.000.000)
-```
-
-### Camera Controller (Build 2.22 multiplayer — offsets diferentes)
-Os offsets acima **não funcionam** nesta sessão multiplayer. O controller existe (mesma vtable `0x7FF70A58D0E8`) mas os campos internos estão zerados.
-
-### Vtable Pattern
-```
-Vtable RVA: 0x1C18CA8
-Offset no player: +0x0D0
-Vtable value: MOD + 0x1C18CA8 = 0x7FF70A4D8CA8
-```
-
----
-
-## Build & Run
+## 🔧 Build & Run
 
 ### Pré-requisitos
-- Windows 10/11
-- Python 3.10+
-- numpy
-- Driver KPRL carregado (para leitura de memória)
+
+- **OS:** Windows 10/11 (x64)
+- **Python:** 3.10+
+- **Dependências:** `numpy`
+- **Driver:** KPRL carregado (requer admin)
+
+### Instalação
+
+```bash
+git clone https://github.com/Supershokk22/overdriver.git
+cd overdriver
+pip install numpy
+```
 
 ### Execução
+
 ```bash
-# 1. Carregar o driver (requer admin)
-# 2. Iniciar o Arma 3 e entrar no mapa
+# Opção 1: Engine + Overlay separados
+python w2s_fast.py      # Terminal 1: Engine ESP
+python overlay_3d.py    # Terminal 2: Overlay 3D
 
-# 3. Rodar o engine (scan + projeção)
-python w2s_fast.py
-
-# 4. Rodar o overlay (em outro terminal)
-python overlay_3d.py
+# Opção 2: Runner integrado
+python runner.py        # Inicia engine loop + overlay
 ```
 
-### Ou usar o runner integrado:
-```bash
-python runner.py
+### Ordem de Execução
+
+```
+1. Carregar driver KPRL (requer admin)
+2. Iniciar Arma 3 → entrar no mapa
+3. python w2s_fast.py (aguardar ~90s para primeiro scan)
+4. python overlay_3d.py (após o scan completar)
 ```
 
 ---
 
-## Limitações Conhecidos
+## 🔬 Descobertas de Engenharia Reversa
 
-1. **Scan inicial lento** (~90s para vtable scan completo)
-2. **Yaw via brute-force** — não detecta direção real da câmera, apenas maximiza spread
-3. **Offsets de câmera mudam** entre sessões multiplayer (requer RE dinâmico)
-4. **BattlEye** pode detectar leitura de memória (risco de ban em multiplayer)
+### Player Struct (Build 2.22)
+
+```
+Offset  Tipo     Descrição
+──────  ───────  ─────────────────────────
++0x000  float    X position (East)
++0x004  float    Z height (Up)
++0x008  float    Y position (North)
++0x0C8  ptr      Camera Controller
++0x0D0  qword    VTABLE → MOD + 0x1C18CA8
++0x2F8  ptr      Orientation data
+```
+
+### Camera Controller
+
+```
+Build 2.22 (single-player):
+  +0x1C8: Eye Position (X, Z_height, Y)
+  +0x1EC: Forward Vector (unitário)
+  +0x2BC: FOV half-angle (0.5)
+
+Build 2.22 (multiplayer):
+  Mesma vtable (0x7FF70A58D0E8), mas offsets internos ZERADOS.
+  Causa provável: lazy initialization ou layout diferente.
+```
+
+### Vtable Detection
+
+```python
+VTABLE_RVA  = 0x1C18CA8
+VT_OFF      = 0x0D0  # offset do vtable pointer no player struct
+VTABLE_ABS  = MOD + VTABLE_RVA  # 0x7FF70A4D8CA8
+```
 
 ---
 
-## Tecnologias Utilizadas
+## ⚠️ Limitações
 
-- **Python 3** — linguagem principal
-- **ctypes** — interface com APIs Windows (GDI, kernel32, user32)
-- **numpy** — processamento rápido de arrays de float
-- **Windows API** — CreateWindowEx, UpdateLayeredWindow, DIBSection, GDI drawing
-- **Driver KPRL** — leitura passiva de memória via IOCTL
+| Item | Status | Notas |
+|------|--------|-------|
+| Scan inicial | ~90s | Vtable scan de ~3000 regiões |
+| Yaw dinâmico | Brute-force | Não detecta câmera real, maximiza spread |
+| Overlay 3D | Funcional | Wireframe 8 cantos, 12 arestas |
+| BattlEye | ⚠️ Risco | Leitura passiva pode ser detectada |
+| Build 2.22 | Parcial | Offsets de câmera instáveis |
 
 ---
 
-## Licença
+## 🛠️ TODO
 
-Este projeto é para fins **educacionais e de pesquisa** em engenharia reversa de sistemas de baixo nível. Não se destina a uso em servidores multiplayer competitivos.
+- [ ] Encontrar offsets estáveis da câmera via scan dinâmico (2 snapshots + diff)
+- [ ] Otimizar scan para < 5s (entity list discovery)
+- [ ] Adicionar snapline (linha do centro até cada player)
+- [ ] Adicionar distância e nome na box
+- [ ] Suporte a múltiplas resoluções
+- [ ] Engine loop integrado (sem necessidade de 2 terminais)
+
+---
+
+## 📄 Licença
+
+Este projeto é para fins **educacionais e de pesquisa** em engenharia reversa de sistemas de baixo nível.
+
+---
+
+<div align="center">
+
+**Feito com** 💻 **Python** + 🔍 **Engenharia Reversa** + 🎮 **Arma 3**
+
+</div>
